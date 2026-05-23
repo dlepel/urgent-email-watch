@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Live config and credentials -- NEVER commit these
+config.json
+token_*.json
+
+# Runtime state (default lives in %LOCALAPPDATA%; ignored here as a safety net)
+state_*.json
+pending_*.json
+alert_log.json
+*.log
+
+# OS / editor cruft
+Thumbs.db
+.DS_Store
+.vscode/

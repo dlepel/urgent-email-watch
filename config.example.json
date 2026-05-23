@@ -1,0 +1,107 @@
+{
+  "_comment": {
+    "about": "Copy this file to config.json (next to watchdog.py) and fill in real values. JSON has no comments, so this _comment block documents every field. The watchdog ignores _comment. This is the version 2 multi-account schema: one config drives many mailboxes.",
+    "notifications": "Shared destinations for the three alert channels, used by every account. pushover.gateway_email is your Pushover email-to-push gateway address (Pushover account page -> 'Your devices can also be reached via email'); leave it blank to disable the Pushover channel everywhere. notify_me.access_code is the code emailed to you after you enable the 'Notify Me' skill in the Alexa app (looks like nmac.XXXXXXXX); leave it blank to disable the Alexa channel everywhere. toast.enabled turns the Windows desktop toast channel on or off globally. A channel fires for a matched email only if it is enabled in the account's channels AND its destination here is configured.",
+    "microsoft": "The single public-client app registration that serves ALL microsoft accounts (work M365 and personal Outlook.com/Hotmail alike). client_id is the Application (client) ID of an app registered in Microsoft Entra ID with 'Supported account types = Accounts in any organizational directory and personal Microsoft accounts', 'Allow public client flows = Yes', and Delegated Microsoft Graph permissions Mail.Read and Mail.Send. No client secret and no admin consent are needed for the device-code flow. authority is normally https://login.microsoftonline.com/common and can be left as-is. Omit this block entirely if you have no microsoft accounts.",
+    "poll_interval_sec": "How often (seconds) to run a full poll cycle across all accounts. 60 is a good default.",
+    "state_dir": "Where the watchdog keeps its state files. Per-account files are state_<slug>.json (poll cursor), pending_<slug>.json (15-minute re-fire tracking) and token_<slug>.json (microsoft refresh token). alert_log.json is the shared audit log. Environment variables and ~ are expanded. Leave it as the default unless you have a reason to change it.",
+    "accounts": "The list of mailboxes to watch. Each account ('instance') has: name (any label; also used to derive the state-file slug); provider ('microsoft' or 'gmail'); the provider's connection fields; scan_folders (mail folders/labels to scan -- 'inbox' is the well-known Inbox, custom folders are matched by display name); channels (which of pushover/toast/alexa this account may fire -- DEFAULTS TO ALL TRUE if the channels block is omitted); and triggers (this account's own trigger list). microsoft accounts need only user_email (the client_id is shared in the microsoft block above) and run 'python watchdog.py --setup' once to sign in. gmail accounts need email plus app_password (a 16-character Google App Password generated after enabling 2-Step Verification).",
+    "trigger_fields": "Each trigger fires if an incoming email matches ANY of: a domain in sender_domains (suffix match on the From address), an address in sender_addresses (exact match, case-insensitive), a keyword in subject_keywords (case-insensitive substring of the subject), or a keyword in body_keywords (case-insensitive substring of the body preview). Set enabled to false to retire a trigger without deleting it. A trigger MAY include its own channels block to override the account default; if absent it inherits the account's channels. rationale is a free-text note ignored by the watchdog."
+  },
+
+  "notifications": {
+    "pushover": {
+      "gateway_email": "YOUR_PUSHOVER_GATEWAY@pomail.net"
+    },
+    "notify_me": {
+      "access_code": "YOUR_NOTIFY_ME_ACCESS_CODE"
+    },
+    "toast": {
+      "enabled": true
+    }
+  },
+
+  "microsoft": {
+    "client_id": "YOUR_ENTRA_APP_CLIENT_ID",
+    "authority": "https://login.microsoftonline.com/common"
+  },
+
+  "poll_interval_sec": 60,
+  "state_dir": "%LOCALAPPDATA%\\UrgentEmailWatch",
+
+  "accounts": [
+    {
+      "name": "Work Mailbox",
+      "provider": "microsoft",
+      "user_email": "you@yourcompany.com",
+      "scan_folders": ["inbox"],
+      "channels": {
+        "pushover": true,
+        "toast": true,
+        "alexa": true
+      },
+      "triggers": [
+        {
+          "name": "Package delivery",
+          "enabled": true,
+          "sender_domains": ["usps.com", "ups.com", "fedex.com"],
+          "sender_addresses": [],
+          "subject_keywords": ["out for delivery", "delivered", "delivery exception"],
+          "body_keywords": [],
+          "channels": {
+            "pushover": true,
+            "toast": true,
+            "alexa": false
+          },
+          "rationale": "Know the moment a package is out for delivery or hits a problem."
+        },
+        {
+          "name": "Bank alert",
+          "enabled": true,
+          "sender_domains": ["yourbank.example.com"],
+          "sender_addresses": ["alerts@yourbank.example.com"],
+          "subject_keywords": ["large transaction", "low balance", "suspicious"],
+          "body_keywords": ["fraud"],
+          "rationale": "Time-sensitive money and fraud alerts. No channels block here, so this trigger inherits the account channels (all three)."
+        }
+      ]
+    },
+    {
+      "name": "Personal Gmail",
+      "provider": "gmail",
+      "email": "you@gmail.com",
+      "app_password": "xxxx xxxx xxxx xxxx",
+      "scan_folders": ["inbox"],
+      "channels": {
+        "pushover": true,
+        "toast": false,
+        "alexa": true
+      },
+      "triggers": [
+        {
+          "name": "Package delivery",
+          "enabled": true,
+          "sender_domains": ["usps.com", "ups.com", "fedex.com", "amazon.com"],
+          "sender_addresses": [],
+          "subject_keywords": ["out for delivery", "delivered", "delivery exception"],
+          "body_keywords": [],
+          "rationale": "Inherits this account's channels (pushover + alexa; toast off)."
+        },
+        {
+          "name": "Bank alert",
+          "enabled": true,
+          "sender_domains": ["yourbank.example.com"],
+          "sender_addresses": ["alerts@yourbank.example.com"],
+          "subject_keywords": ["large transaction", "low balance", "suspicious"],
+          "body_keywords": ["fraud"],
+          "channels": {
+            "pushover": true,
+            "toast": false,
+            "alexa": true
+          },
+          "rationale": "Explicit channels block overrides the account default for this trigger only."
+        }
+      ]
+    }
+  ]
+}
