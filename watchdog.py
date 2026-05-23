@@ -119,14 +119,57 @@ _state_lock = threading.Lock()
 
 # --- Logging -----------------------------------------------------------------
 
+# When set, _log / _alog also append their output to this file. The installer
+# runs the watchdog under pythonw.exe (no console), so file logging is the
+# only way operational output -- including auth failures -- survives.
+_LOG_FILE = None
+
+# Rotate the log file once it grows past roughly this many bytes.
+_LOG_MAX_BYTES = 1024 * 1024
+
+
+def _write_log_line(line):
+    """Append one line (with a UTC timestamp) to _LOG_FILE if it is set.
+    Logging must never crash the watchdog, so all errors are swallowed."""
+    if not _LOG_FILE:
+        return
+    try:
+        stamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        with open(_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{stamp} {line}\n")
+    except Exception:
+        pass
+
+
+def init_log_file(path):
+    """Point file logging at `path`, performing one-time size rotation: if the
+    file already exists and exceeds ~1 MB, rename it to '<path>.1' (replacing
+    any existing '.1'). All errors are swallowed -- logging is best effort."""
+    global _LOG_FILE
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > _LOG_MAX_BYTES:
+            rotated = path + ".1"
+            try:
+                os.replace(path, rotated)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    _LOG_FILE = path
+
+
 def _log(msg):
     """Print with a [watchdog] prefix so log lines are filterable."""
-    print(f"[watchdog] {msg}", flush=True)
+    line = f"[watchdog] {msg}"
+    print(line, flush=True)
+    _write_log_line(line)
 
 
 def _alog(slug, msg):
     """Log a message tagged with the account slug it belongs to."""
-    print(f"[watchdog:{slug}] {msg}", flush=True)
+    line = f"[watchdog:{slug}] {msg}"
+    print(line, flush=True)
+    _write_log_line(line)
 
 
 # --- JSON / time helpers -----------------------------------------------------
@@ -720,31 +763,47 @@ class MicrosoftProvider(MailProvider):
             "$filter": f"receivedDateTime gt {since_iso}",
             "$orderby": "receivedDateTime desc",
             "$top": "50",
-            "$select": "id,subject,from,bodyPreview,receivedDateTime,isRead",
+            "$select": "id,subject,from,bodyPreview,receivedDateTime,isRead,internetMessageId",
         }
         url = url_base + "?" + urllib.parse.urlencode(params)
-        req = urllib.request.Request(url, headers={
+        headers = {
             "Authorization": f"Bearer {token}",
             "Prefer": 'outlook.body-content-type="text"',
-        })
-        try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                data = json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", errors="replace")
-            _alog(self.slug,
-                  f"list messages failed in {folder}: HTTP {e.code} "
-                  f"{detail[:200]}")
-            return []
-        except Exception as e:
-            _alog(self.slug, f"list messages error in {folder}: {e}")
-            return []
+        }
+        # Graph returns at most $top results per page. After a long outage a
+        # folder can hold >50 missed messages, so follow @odata.nextLink.
+        # Cap the page count to bound the work.
+        values = []
+        next_url = url
+        pages = 0
+        max_pages = 20
+        while next_url and pages < max_pages:
+            pages += 1
+            req = urllib.request.Request(next_url, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    data = json.loads(resp.read())
+            except urllib.error.HTTPError as e:
+                detail = e.read().decode("utf-8", errors="replace")
+                _alog(self.slug,
+                      f"list messages failed in {folder}: HTTP {e.code} "
+                      f"{detail[:200]}")
+                return []
+            except Exception as e:
+                _alog(self.slug, f"list messages error in {folder}: {e}")
+                return []
+            values.extend(data.get("value", []))
+            next_url = data.get("@odata.nextLink")
 
         out = []
-        for m in data.get("value", []):
+        for m in values:
             sender = (m.get("from") or {}).get("emailAddress") or {}
             out.append({
                 "id": m.get("id"),
+                # Cross-folder dedup key: the RFC822 Message-ID is stable even
+                # when a message moves between folders (which changes its
+                # Graph id). Fall back to the Graph id if absent.
+                "dedup_id": m.get("internetMessageId") or m.get("id"),
                 "subject": m.get("subject") or "",
                 "from_address": sender.get("address") or "",
                 "from_name": sender.get("name") or "",
@@ -758,12 +817,16 @@ class MicrosoftProvider(MailProvider):
     def list_new_messages(self, cursor):
         """List new messages across all configured folders. The cursor is the
         ISO timestamp of the last poll. The new cursor is 'now'."""
+        # Capture the cursor timestamp BEFORE the folder queries. If we waited
+        # until after, mail that arrived during the query window would fall
+        # into the gap and be skipped by both this poll and the next.
+        poll_started = _now_iso()
         since_iso = cursor or self.initial_cursor()
         messages = []
         for folder in self.account.get("scan_folders", ["inbox"]):
             messages.extend(self._list_folder(folder, since_iso))
-        # Advance the time cursor to now regardless of whether mail arrived.
-        return messages, _now_iso()
+        # Advance the time cursor to when this poll began.
+        return messages, poll_started
 
     def is_message_read(self, message_id):
         """Delegated GET to check the isRead flag of one message."""
@@ -854,9 +917,10 @@ class GmailProvider(MailProvider):
             pass
 
     def initial_cursor(self):
-        """Gmail's cursor is a UID map {folder: last_uid}. On first run it is
-        an empty dict; list_new_messages then primes it to the current high
-        watermark so historical mail is not re-alerted."""
+        """Gmail's cursor is a per-folder map
+        {folder: {"uidvalidity": <str>, "uid": <int>}}. On first run it is an
+        empty dict; list_new_messages then primes each folder to the current
+        high watermark so historical mail is not re-alerted."""
         return {}
 
     def connect(self):
@@ -871,20 +935,54 @@ class GmailProvider(MailProvider):
             pass
         _alog(self.slug, f"Gmail IMAP+SMTP login verified ({self.email_addr})")
 
+    def _mailbox_name(self, folder):
+        """Map a configured folder name to the IMAP mailbox name. 'inbox'
+        maps to INBOX; other names are passed through (Gmail labels are
+        addressable as folder names). Labels with spaces are quoted."""
+        mailbox = "INBOX" if folder.lower() == "inbox" else folder
+        if " " in mailbox and not mailbox.startswith('"'):
+            mailbox = '"' + mailbox + '"'
+        return mailbox
+
     def _select_folder(self, imap, folder):
         """SELECT a folder/label. 'inbox' maps to INBOX; other names are
         passed through (Gmail labels are addressable as folder names).
         Returns True on success."""
-        mailbox = "INBOX" if folder.lower() == "inbox" else folder
-        # Gmail labels with spaces need to be quoted for SELECT.
-        if " " in mailbox and not mailbox.startswith('"'):
-            mailbox = '"' + mailbox + '"'
+        mailbox = self._mailbox_name(folder)
         try:
             typ, _ = imap.select(mailbox, readonly=True)
             return typ == "OK"
         except Exception as e:
             _alog(self.slug, f"IMAP select failed for '{folder}': {e}")
             return False
+
+    def _uidvalidity(self, imap, folder):
+        """Return the current UIDVALIDITY for `folder` as a string, or None
+        if it cannot be determined. Reads the value the SELECT response left
+        in untagged_responses, falling back to an explicit STATUS query."""
+        try:
+            resp = imap.untagged_responses.get("UIDVALIDITY")
+            if resp:
+                val = resp[0]
+                if isinstance(val, bytes):
+                    val = val.decode("ascii", "replace")
+                return str(val).strip()
+        except Exception:
+            pass
+        try:
+            mailbox = self._mailbox_name(folder)
+            typ, data = imap.status(mailbox, "(UIDVALIDITY)")
+            if typ == "OK" and data and data[0]:
+                blob = data[0]
+                if isinstance(blob, bytes):
+                    blob = blob.decode("ascii", "replace")
+                m = re.search(r"UIDVALIDITY\s+(\d+)", blob)
+                if m:
+                    return m.group(1)
+        except Exception as e:
+            _alog(self.slug,
+                  f"IMAP UIDVALIDITY lookup failed for '{folder}': {e}")
+        return None
 
     @staticmethod
     def _decode_header(raw):
@@ -927,58 +1025,104 @@ class GmailProvider(MailProvider):
             pass
         return ""
 
-    def _fetch_folder(self, imap, folder, last_uid):
-        """Fetch messages in `folder` with UID greater than last_uid.
+    def _fetch_folder(self, imap, folder, cursor_entry):
+        """Fetch messages in `folder` with UID greater than the cursor.
 
-        Returns (messages, new_high_uid). If last_uid is None (first sight of
-        this folder), it primes to the current max UID and returns no messages
-        so historical mail is not alerted.
+        `cursor_entry` is this folder's stored cursor value, expected to be a
+        dict {"uidvalidity": <str>, "uid": <int>}. It may also be None (never
+        seen), or an int from the legacy schema.
+
+        Returns (messages, new_entry) where new_entry is the cursor value to
+        persist for this folder. new_entry is None when the folder could not
+        be primed -- the absent entry makes the folder re-prime next poll
+        rather than treating the whole mailbox as new (Fix A).
+
+        First sight of a folder -- no entry, a legacy int entry, or a changed
+        UIDVALIDITY -- primes to the current max UID and alerts nothing
+        (Minor 2 / UIDVALIDITY safety + legacy-cursor migration).
         """
         if not self._select_folder(imap, folder):
-            return [], last_uid
+            # Could not select -- preserve the existing cursor entry as-is
+            # (when it is a dict) so the folder is reconsidered next poll.
+            return [], cursor_entry if isinstance(cursor_entry, dict) else None
+
+        cur_uidvalidity = self._uidvalidity(imap, folder)
+
+        # Determine last_uid only if the stored entry is a dict whose
+        # uidvalidity matches the folder's current UIDVALIDITY. Anything else
+        # (no entry, legacy int entry, or a changed UIDVALIDITY) is treated as
+        # first sight and the folder is primed.
+        last_uid = None
+        if (isinstance(cursor_entry, dict)
+                and cur_uidvalidity is not None
+                and str(cursor_entry.get("uidvalidity")) == cur_uidvalidity):
+            try:
+                last_uid = int(cursor_entry.get("uid"))
+            except (TypeError, ValueError):
+                last_uid = None
 
         if last_uid is None:
             # Prime: record the current high-water UID, alert nothing.
             try:
                 typ, data = imap.uid("search", None, "ALL")
                 if typ != "OK":
-                    return [], 0
+                    # Prime failed -- leave the folder unprimed so it
+                    # re-primes next poll instead of persisting a 0 cursor
+                    # that would treat the whole mailbox as new (Fix A).
+                    return [], None
                 uids = data[0].split() if data and data[0] else []
                 high = max((int(u) for u in uids), default=0)
-                return [], high
+                if cur_uidvalidity is None:
+                    # Without a UIDVALIDITY we cannot store a safe dict
+                    # entry; leave unprimed so we retry next poll (Fix A).
+                    return [], None
+                return [], {"uidvalidity": cur_uidvalidity, "uid": high}
             except Exception as e:
                 _alog(self.slug, f"IMAP prime failed for '{folder}': {e}")
-                return [], 0
+                # Prime failed -- leave the folder unprimed (Fix A).
+                return [], None
+
+        # From here on we have a valid last_uid and a matching UIDVALIDITY.
+        # The new cursor entry, if unchanged, keeps the same UIDVALIDITY.
+        unchanged_entry = {"uidvalidity": cur_uidvalidity, "uid": last_uid}
 
         # Search for UIDs strictly greater than the cursor.
         try:
             typ, data = imap.uid("search", None, f"UID {last_uid + 1}:*")
             if typ != "OK":
-                return [], last_uid
+                return [], unchanged_entry
             uids = data[0].split() if data and data[0] else []
         except Exception as e:
             _alog(self.slug, f"IMAP search failed for '{folder}': {e}")
-            return [], last_uid
+            return [], unchanged_entry
 
         # "UID n:*" can echo back the cursor UID itself; filter to > last_uid.
         new_uids = sorted(
             u for u in (int(x) for x in uids) if u > last_uid
         )
         if not new_uids:
-            return [], last_uid
+            return [], unchanged_entry
 
         messages = []
+        # high advances only across the contiguous prefix of UIDs that were
+        # successfully fetched AND parsed. The first failure freezes the
+        # high-water mark so the failed UID -- and everything after it -- is
+        # re-examined next poll; later messages are still processed and
+        # appended, and idempotency dedups any re-alerts (Fix C).
         high = last_uid
+        contiguous_ok = True
         for uid in new_uids:
-            high = max(high, uid)
+            ok = False
             try:
                 typ, fetched = imap.uid(
                     "fetch", str(uid),
                     "(FLAGS BODY.PEEK[HEADER] BODY.PEEK[TEXT])")
                 if typ != "OK" or not fetched:
+                    contiguous_ok = False
                     continue
             except Exception as e:
                 _alog(self.slug, f"IMAP fetch failed for UID {uid}: {e}")
+                contiguous_ok = False
                 continue
 
             flags = b""
@@ -1041,6 +1185,10 @@ class GmailProvider(MailProvider):
 
             messages.append({
                 "id": stable_id,
+                # Cross-folder dedup key: prefer the RFC822 Message-ID, which
+                # is stable when a message moves between folders. Fall back to
+                # the folder:UID composite (the existing stable id).
+                "dedup_id": message_id or f"{folder}:UID{uid}",
                 "_uid": uid,           # internal: used by is_message_read
                 "_folder_raw": folder,
                 "subject": subject,
@@ -1052,26 +1200,43 @@ class GmailProvider(MailProvider):
                 "folder": folder,
             })
 
-        return messages, high
+            # This UID was fetched AND parsed AND appended. Advance the
+            # high-water mark only while the success run is still unbroken
+            # (Fix C: the first failure above freezes high here).
+            ok = True
+            if contiguous_ok and ok:
+                high = uid
+
+        return messages, {"uidvalidity": cur_uidvalidity, "uid": high}
 
     def list_new_messages(self, cursor):
         """Walk every configured folder, returning new messages and the
-        updated per-folder UID cursor map."""
-        uid_map = dict(cursor) if isinstance(cursor, dict) else {}
+        updated per-folder cursor map.
+
+        The cursor map keys folders to {"uidvalidity": <str>, "uid": <int>}.
+        A folder whose new entry is None (prime failed) is left OUT of the
+        returned map so it re-primes on the next poll (Fix A).
+        """
+        old_map = dict(cursor) if isinstance(cursor, dict) else {}
+        new_map = {}
         messages = []
         imap = None
         try:
             imap = self._imap_connect()
             for folder in self.account.get("scan_folders", ["inbox"]):
-                last_uid = uid_map.get(folder)  # None => first sight
-                folder_msgs, new_high = self._fetch_folder(
-                    imap, folder, last_uid)
+                # cursor_entry may be a dict (current schema), an int (legacy
+                # schema), or absent (first sight).
+                cursor_entry = old_map.get(folder)
+                folder_msgs, new_entry = self._fetch_folder(
+                    imap, folder, cursor_entry)
                 messages.extend(folder_msgs)
-                uid_map[folder] = new_high
+                if new_entry is not None:
+                    new_map[folder] = new_entry
+                # new_entry is None => omit the folder so it re-primes.
         finally:
             if imap is not None:
                 self._imap_logout(imap)
-        return messages, uid_map
+        return messages, new_map
 
     def is_message_read(self, message_id):
         """Re-fetch FLAGS for the message and look for the \\Seen flag.
@@ -1100,7 +1265,8 @@ class GmailProvider(MailProvider):
                 if not self._select_folder(imap, folder):
                     continue
                 typ, data = imap.uid(
-                    "search", None, "HEADER", "Message-ID", message_id)
+                    "search", None, "HEADER", "Message-ID",
+                    '"' + message_id + '"')
                 if typ != "OK" or not data or not data[0]:
                     continue
                 uid = data[0].split()[0].decode()
@@ -1544,6 +1710,12 @@ def check_pending_alerts(cfg, account, provider):
         changed = True
         _alog(slug, f"RE-FIRE for "
               f"'{(email_meta.get('subject') or '')[:50]}': ok={ok}")
+        # Once the final re-fire is done the entry would otherwise be skipped
+        # forever yet kept on disk, so pending_<slug>.json grows without
+        # bound. Drop it now -- the shared alert log still dedups the
+        # message, so removing it from pending is safe (Fix D).
+        if entry["re_fire_count"] >= RE_FIRE_MAX_COUNT:
+            del pending["alerts"][alert_id]
 
     if changed:
         with _state_lock:
@@ -1582,9 +1754,13 @@ def run_account_pass(cfg, account, provider):
 
     for email_dict in messages:
         mid = email_dict.get("id")
-        if not mid or mid in seen_in_pass:
+        # Within-pass dedup keys on dedup_id (stable across folders) so a
+        # message that moved between two scanned folders is not double-
+        # alerted. Pending/log/idempotency keying still uses `id` unchanged.
+        dedup_key = email_dict.get("dedup_id") or email_dict.get("id")
+        if not mid or dedup_key in seen_in_pass:
             continue
-        seen_in_pass.add(mid)
+        seen_in_pass.add(dedup_key)
 
         # Idempotency: per-account namespace. A message already handled for
         # this account never fires again.
@@ -1822,6 +1998,9 @@ def main(argv):
     except ConfigError as e:
         print(f"CONFIG ERROR: {e}", file=sys.stderr)
         return 2
+
+    # Enable file logging for all modes -- the installer runs headless.
+    init_log_file(os.path.join(cfg["_state_dir_resolved"], "watchdog.log"))
 
     if arg == "--setup":
         return _mode_setup(cfg)
